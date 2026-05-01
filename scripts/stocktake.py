@@ -103,6 +103,10 @@ def _clean_barcode(x) -> str:
         s = s[:-2]
 
     s = "".join(ch for ch in s if ch.isdigit())
+    if s == "":
+        return ""
+
+    s = s.lstrip("0") or "0"
     return s
 
 

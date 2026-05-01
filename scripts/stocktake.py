@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 # Column heuristics
 BARCODE_CANDS = ["barcode", "bar code", "code", "ean", "upc", "codigo", "código"]
 COUNT_CANDS = ["count", "qty", "quantity", "cantidad", "scans", "total units", "total unit", "units"]
+PRODUCT_NAME_CANDS = ["product name", "product", "name", "nombre", "description"]
+NOTES_CANDS = ["notes", "note", "comments", "comment", "notas"]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -132,7 +134,7 @@ def _load_scanner(path: Path) -> pd.DataFrame:
     df.columns = [str(c).strip() if c is not None else "" for c in df.columns]
 
     if df.empty:
-        return pd.DataFrame(columns=["barcode", "count"])
+        return pd.DataFrame(columns=["barcode", "count", "scanner_name", "scanner_notes"])
 
     bcol = _find_col(df, BARCODE_CANDS)
     ccol = _find_col(df, COUNT_CANDS) if bcol else None
@@ -187,7 +189,14 @@ def _load_scanner(path: Path) -> pd.DataFrame:
             df["_u"] = 1
             agg = df.groupby("barcode", as_index=False)["_u"].sum().rename(columns={"_u": "count"})
 
+        agg["scanner_name"] = None
+        agg["scanner_notes"] = None
+
         return agg
+
+    # Detect optional text columns (product name and notes from scanner)
+    pncol = _find_col(df, PRODUCT_NAME_CANDS)
+    notecol = _find_col(df, NOTES_CANDS)
 
     # 3) Normal path (barcode column detected)
     df[bcol] = df[bcol].map(_clean_barcode)
@@ -200,6 +209,19 @@ def _load_scanner(path: Path) -> pd.DataFrame:
     else:
         df["_u"] = 1
         agg = df.groupby(bcol, as_index=False)["_u"].sum().rename(columns={bcol: "barcode", "_u": "count"})
+
+    # Attach first non-null value of text columns per barcode
+    for src_col, dest_col in [(pncol, "scanner_name"), (notecol, "scanner_notes")]:
+        if src_col and src_col in df.columns:
+            first_val = (
+                df[[bcol, src_col]]
+                .rename(columns={bcol: "barcode", src_col: dest_col})
+                .groupby("barcode", as_index=False)
+                .agg({dest_col: lambda x: next((v for v in x if pd.notna(v) and str(v).strip()), None)})
+            )
+            agg = agg.merge(first_val, on="barcode", how="left")
+        else:
+            agg[dest_col] = None
 
     return agg
 
@@ -407,8 +429,19 @@ def _match(scans: pd.DataFrame, products: pd.DataFrame) -> tuple[pd.DataFrame, p
         raw_count = pd.to_numeric(r.get("count", 0), errors="coerce")
         c = 0 if pd.isna(raw_count) else int(raw_count)
 
+        scanner_name = str(r.get("scanner_name", "") or "").strip()
+        scanner_notes = str(r.get("scanner_notes", "") or "").strip()
+
         if not r.get("ProductID") or pd.isna(r.get("ProductID")):
-            unmatched_rows.append({"scanned_barcode": b, "count": c, "reason": "unknown_barcode"})
+            unmatched_rows.append(
+                {
+                    "scanned_barcode": b,
+                    "count": c,
+                    "reason": "unknown_barcode",
+                    "scanner_name": scanner_name,
+                    "scanner_notes": scanner_notes,
+                }
+            )
             continue
 
         master_id = r.get("_master_product_id")
@@ -422,6 +455,8 @@ def _match(scans: pd.DataFrame, products: pd.DataFrame) -> tuple[pd.DataFrame, p
                     "count": c,
                     "reason": "cannot_convert_missing_unit_variant",
                     "matched_product_name": str(r.get("ProductName", "")).strip(),
+                    "scanner_name": scanner_name,
+                    "scanner_notes": scanner_notes,
                 }
             )
             continue
@@ -443,7 +478,7 @@ def _match(scans: pd.DataFrame, products: pd.DataFrame) -> tuple[pd.DataFrame, p
     unmatched = (
         pd.DataFrame(unmatched_rows)
         if unmatched_rows
-        else pd.DataFrame(columns=["scanned_barcode", "count", "reason"])
+        else pd.DataFrame(columns=["scanned_barcode", "count", "reason", "scanner_name", "scanner_notes"])
     )
 
     if not matched.empty:
@@ -461,13 +496,22 @@ def run_stocktake_many(scanner_paths: list[Path], products_path: Path, outdir: P
     for p in scanner_paths:
         if p is None or not str(p).strip():
             continue
-        scans_list.append(_load_scanner(p))
+        scan_df = _load_scanner(p)
+        for col in ("scanner_name", "scanner_notes"):
+            if col not in scan_df.columns:
+                scan_df[col] = None
+        scans_list.append(scan_df)
 
     if not scans_list:
         raise ValueError("No scanner files provided.")
 
     scans = pd.concat(scans_list, ignore_index=True)
-    scans = scans.groupby("barcode", as_index=False)["count"].sum()
+    # Sum counts per barcode; preserve first non-null text columns across files
+    scans = scans.groupby("barcode", as_index=False).agg(
+        count=("count", "sum"),
+        scanner_name=("scanner_name", lambda x: next((v for v in x if pd.notna(v) and str(v).strip()), None)),
+        scanner_notes=("scanner_notes", lambda x: next((v for v in x if pd.notna(v) and str(v).strip()), None)),
+    )
 
     # Load variant map from DB once, then use it for product resolution
     variant_map = _fetch_variant_map()
